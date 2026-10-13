@@ -1771,6 +1771,17 @@ function getSharedDbClient(){
   });
   return sharedDbClient;
 }
+async function getSharedAuthUser(db){
+  if(!db) return null;
+  try{
+    const r=await db.auth.getUser();
+    if(r.data?.user) return r.data.user;
+  }catch(e){console.warn('shared getUser',e)}
+  try{
+    const r=await db.auth.getSession();
+    return r.data?.session?.user||null;
+  }catch(e){console.warn('shared getSession',e);return null}
+}
 
 function sharedSetStatus(text){
   const el=document.getElementById("sharedConnectionStatus");
@@ -1918,7 +1929,7 @@ function startSharedRoomWatch(){
 async function createSharedRoom(){
   const db=getSharedDbClient();
   if(!db) return;
-  const {data:{user}}=await db.auth.getUser();
+  const user=await getSharedAuthUser(db);
   if(!user){
     alert('创建永久日记房间需要先登录 My Money 云端账号。\n\n请先到「云端同步」登录，然后再创建房间。');
     return;
@@ -1939,7 +1950,7 @@ async function createSharedRoom(){
   }
   if(!created){
     console.error(error);
-    alert('创建房间失败：\n'+(error?.message||'数据库错误'));
+    alert('创建房间失败：\n'+(error?.message||'数据库错误')+(error?.code?`\n\n错误代码：${error.code}`:'')+(error?.details?`\n\n详情：${error.details}`:''));
     return;
   }
   sharedRoomCode=created.code;
@@ -1994,7 +2005,7 @@ async function closeSharedRoomByOwner(){
   if(!confirm('确定要关闭这个永久日记房间吗？\n\n关闭后，朋友将不能再加入或发送新的日记，而且这个房间不能重新打开。')) return;
   const db=getSharedDbClient();
   if(!db) return;
-  const {data:{user}}=await db.auth.getUser();
+  const user=await getSharedAuthUser(db);
   if(!user || user.id!==sharedRoomOwnerId){alert('只有房间主人本人可以关闭这个房间。');return;}
   const {error}=await db.from('my_money_shared_rooms').update({closed_at:new Date().toISOString()}).eq('code',sharedRoomCode).eq('owner_id',user.id).is('closed_at',null);
   if(error){
@@ -2044,7 +2055,8 @@ function sendSharedPost(){
   const db=getSharedDbClient();
   if(!db) return;
   const finish=async photos=>{
-    const {data:{user}}=await db.auth.getUser();
+    const user=await getSharedAuthUser(db);
+    if(!user){alert('你的登录状态已经失效，请重新登录 My Money 云端账号。');return;}
     const row={
       room_code:sharedRoomCode,
       sender_client_id:sharedMyOwnerId,
@@ -2642,7 +2654,7 @@ body.diary-mode .container{max-width:1050px}
   async function uploadCloud(payloadData){
     const c=ensureClient();if(!c||!cloudUser)throw new Error('尚未登录云端账号');
     const updatedAt=Date.now();
-    const payload={version:2,updatedAt,data:payloadData||localSnapshot()};
+    const payload={version:3,ownerUserId:String(cloudUser?.id||''),updatedAt,data:payloadData||localSnapshot()};
     const blob=new Blob([JSON.stringify(payload)],{type:'application/json'});
     const {error}=await c.storage.from(BUCKET).upload(cloudUser.id+'/'+FILE_NAME,blob,{contentType:'application/json',upsert:true,cacheControl:'0'});
     if(error)throw error;
@@ -2662,10 +2674,23 @@ body.diary-mode .container{max-width:1050px}
     if(syncBusy)return;
     syncBusy=true;
     try{
+      if(!cloudUser) cloudUser=await authSession();
+      if(!cloudUser) throw new Error('尚未登录云端账号。');
       setCloudStatus('⏳ 正在安全检查云端资料……');
       const remote=await downloadCloud();
       const local=localSnapshot();
       const localHas=hasMeaningfulLocalData();
+      const currentUid=String(cloudUser.id||'');
+
+      // Never let one account read another account's cloud file.
+      if(remote && remote.ownerUserId && String(remote.ownerUserId)!==currentUid){
+        console.warn('Ignoring cloud data belonging to another user',remote.ownerUserId,currentUid);
+        clearUserBoundLocalData();
+        await uploadCloud(localSnapshot());
+        setCloudStatus('☁️ 这是新账号，已从空白资料开始。',true);
+        startAutoSync();return;
+      }
+
       if(!remote){
         if(localHas){
           await uploadCloud(local);
@@ -2676,6 +2701,19 @@ body.diary-mode .container{max-width:1050px}
         }
         startAutoSync();return;
       }
+
+      // Old files created before account-isolation did not carry an owner id.
+      // On a brand-new browser/account combination, do not silently import such legacy data.
+      // The user can still recover a legitimate old account by logging into it on a browser
+      // that already has its account marker, after which future uploads are tagged.
+      if(!remote.ownerUserId && !localStorage.getItem('myMoneyCloudKnownUser_'+currentUid)){
+        clearUserBoundLocalData();
+        await uploadCloud(localSnapshot());
+        localStorage.setItem('myMoneyCloudKnownUser_'+currentUid,'1');
+        setCloudStatus('☁️ 新账号首次登录：已保持空白，不会带入旧测试资料。',true);
+        startAutoSync();return;
+      }
+
       const rt=Number(remote.updatedAt||0),lt=localUpdated();
       const lr=lastRemote(),ll=lastLocal();
       const remoteChanged=lr?rt>lr:true;
@@ -2701,6 +2739,7 @@ body.diary-mode .container{max-width:1050px}
         localStorage.setItem(LAST_LOCAL_KEY,String(lt));
         setCloudStatus('☁️ 云端已同步，没有需要处理的更新。',true);
       }
+      localStorage.setItem('myMoneyCloudKnownUser_'+currentUid,'1');
       startAutoSync();
     }catch(err){
       console.error(err);
