@@ -3040,44 +3040,63 @@ body.diary-mode .container{max-width:1050px}
     return true;
   }
 
+  let sharedCreateBusy=false;
+  let sharedJoinBusy=false;
+
   async function createRoom(){
-    const c=db(),u=await userOf(c);
-    if(!c||!u){alert('创建房间需要先登录 My Money 云端账号。');return}
-    const name=(prompt('请给这个分享日记房间取一个名字：','我的日记')||'').trim();
-    if(!name)return;
+    if(sharedCreateBusy)return;
+    sharedCreateBusy=true;
+    try{
+      const c=db(),u=await userOf(c);
+      if(!c||!u){alert('创建房间需要先登录 My Money 云端账号。');return}
+      const name=(prompt('请给这个分享日记房间取一个名字：','我的日记')||'').trim();
+      if(!name)return;
 
-    let created=null,last=null;
-    for(let i=0;i<10;i++){
-      const code=sharedRandomCode();
-      const {error}=await c.from('my_money_shared_rooms').insert({code,owner_id:u.id,room_name:name});
-      if(!error){created={code,owner_id:u.id,room_name:name};break}
-      last=error;
-      if(error.code!=='23505')break;
-    }
-    if(!created){
-      console.error('v14 create room',last);
-      alert('创建房间失败：\n'+([last?.message,last?.code,last?.details,last?.hint].filter(Boolean).join('\n')||'数据库错误'));
-      return;
-    }
+      /* IMPORTANT: room + owner membership are created by ONE atomic RPC.
+         This prevents orphan rooms and repeated rooms when the old insert
+         succeeds but the membership step fails or the button is double-clicked. */
+      const result=await c.rpc('my_money_create_shared_room',{p_room_name:name});
+      if(result.error){
+        console.error('v14 create room RPC',result.error);
+        alert('创建房间失败：\n'+(result.error.message||'数据库错误'));
+        return;
+      }
+      const created=Array.isArray(result.data)?result.data[0]:result.data;
+      // The RPC returns `code`; older compatible versions may return `room_code`.
+      // Accept both so the client does not depend on one exact column label.
+      const createdCode=String(created?.room_code||created?.code||'').trim().toUpperCase();
+      const createdUser=created?.user_id||u.id;
+      if(!createdCode||!createdUser){
+        console.error('v14 unexpected create result',result.data);
+        alert('创建房间失败：服务器没有返回完整的房间资料。');
+        return;
+      }
 
-    /* The SQL trigger/backfill makes the owner a member. The RPC is also safe
-       and gives us the exact row used by the room list. */
-    const jr=await c.rpc('my_money_join_shared_room',{p_code:created.code,p_nickname:name});
-    if(jr.error){
-      console.error('v14 owner membership RPC',jr.error);
-      alert('房间已经建立，但房主成员资料建立失败：\n'+(jr.error.message||'数据库错误'));
-      return;
+      const row={
+        room_code:createdCode,
+        user_id:createdUser,
+        nickname:created.nickname||'房主',
+        joined_at:created.joined_at||new Date().toISOString(),
+        owner_id:created.owner_id||u.id,
+        room_name:created.room_name||name,
+        created_at:created.created_at||new Date().toISOString(),
+        closed_at:created.closed_at||null,
+        is_owner:true
+      };
+      roomCache.set(createdCode,row);
+      rememberRoom(u.id,createdCode);
+      await enterRoom(createdCode,row);
+    }finally{
+      sharedCreateBusy=false;
     }
-    const member=Array.isArray(jr.data)?jr.data[0]:jr.data;
-    const row={room_code:created.code,user_id:u.id,nickname:member?.nickname||name,joined_at:member?.joined_at||new Date().toISOString(),owner_id:created.owner_id,room_name:created.room_name,created_at:new Date().toISOString(),closed_at:null,is_owner:true};
-    roomCache.set(created.code,row);
-    rememberRoom(u.id,created.code);
-    await enterRoom(created.code,row);
   }
 
   async function joinRoom(){
-    const c=db(),u=await userOf(c);
-    if(!c||!u){alert('加入房间需要先登录 My Money 云端账号。');return}
+    if(sharedJoinBusy)return;
+    sharedJoinBusy=true;
+    try{
+      const c=db(),u=await userOf(c);
+      if(!c||!u){alert('加入房间需要先登录 My Money 云端账号。');return}
     const input=document.getElementById('sharedJoinCode');
     const code=(input?.value||'').trim().toUpperCase();
     if(!code){alert('请输入朋友的房间号码。');return}
@@ -3101,7 +3120,10 @@ body.diary-mode .container{max-width:1050px}
     const row={room_code:m.room_code,user_id:m.user_id,nickname:m.nickname,joined_at:m.joined_at,owner_id:m.owner_id,room_name:m.room_name,created_at:m.created_at,closed_at:m.closed_at,is_owner:String(m.owner_id)===String(u.id)};
     roomCache.set(String(room.code).toUpperCase(),row);
     rememberRoom(u.id,room.code);
-    await enterRoom(room.code,row);
+      await enterRoom(room.code,row);
+    }finally{
+      sharedJoinBusy=false;
+    }
   }
 
   async function setNickname(code){
